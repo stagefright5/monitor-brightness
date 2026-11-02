@@ -3,6 +3,7 @@ import Darwin
 import ServiceManagement
 import Combine
 import QuartzCore
+import SwiftUI
 
 struct Monitor: Identifiable, Equatable {
     let id: String
@@ -80,7 +81,9 @@ enum DDC {
 final class BrightnessModel: ObservableObject {
     @Published var monitors: [Monitor] = []
     @Published var selectedID = ""
-    @Published var brightness = 0.0
+    @Published var brightness = UserDefaults.standard.double(forKey: "lastBrightness")
+    /// True once any brightness is known, so the panel can show it while re-reading.
+    @Published var hasValue = UserDefaults.standard.object(forKey: "lastBrightness") != nil
     @Published var ready = false
     @Published var loading = false
     @Published var applying = false
@@ -88,7 +91,13 @@ final class BrightnessModel: ObservableObject {
     private var maximum = 100
     private var revision = 0
     private var pending: Task<Void, Never>?
+    /// A slider change made while the monitor is still being read; applied once it is ready.
+    private var queued: Double?
     var selected: Monitor? { monitors.first { $0.id == selectedID } }
+    /// The selected monitor's name, or the last one seen while monitors are being scanned.
+    var displayName: String {
+        selected?.name ?? UserDefaults.standard.string(forKey: "displayName") ?? "External Display"
+    }
 
     func refresh() {
         pending?.cancel()
@@ -124,6 +133,7 @@ final class BrightnessModel: ObservableObject {
 
     func select(_ id: String) {
         selectedID = id
+        queued = nil
         pending?.cancel()
         revision += 1
         let currentRevision = revision
@@ -149,12 +159,24 @@ final class BrightnessModel: ObservableObject {
         guard value <= maxValue else { throw BrightnessError(message: "The monitor reported an invalid brightness range.") }
         maximum = maxValue
         brightness = Double(value) / Double(maxValue) * 100
+        hasValue = true
         ready = true
         loading = false
         UserDefaults.standard.set(monitor.id, forKey: "display")
+        UserDefaults.standard.set(monitor.name, forKey: "displayName")
+        UserDefaults.standard.set(brightness, forKey: "lastBrightness")
+        if let queued {
+            self.queued = nil
+            setBrightness(queued)
+        }
     }
 
     func setBrightness(_ percent: Double) {
+        if loading && hasValue {
+            queued = min(100, max(0, percent))
+            brightness = queued!
+            return
+        }
         guard ready, let monitor = selected else { return }
         brightness = min(100, max(0, percent))
         pending?.cancel()
@@ -172,6 +194,7 @@ final class BrightnessModel: ObservableObject {
                 let actual = try await DDC.read(monitor)
                 guard revision == currentRevision else { return }
                 brightness = Double(actual) / Double(maximum) * 100
+                UserDefaults.standard.set(brightness, forKey: "lastBrightness")
                 applying = false
                 if abs(actual - value) > 1 {
                     error = "The monitor kept a different brightness. Check whether its picture mode locks brightness."
@@ -232,192 +255,163 @@ final class LoginSettings: ObservableObject {
     }
 }
 
+enum Motion {
+    /// Fitted to a frame-by-frame recording of Control Center on macOS 27: its panel forms
+    /// on a critically damped spring and drifts 3 pt — down while appearing (ω ≈ 23 rad/s,
+    /// half formed after ~70 ms) and up while disappearing (ω ≈ 31 rad/s).
+    static let openResponse = 2 * Double.pi / 23
+    /// Slower than the fitted 31 rad/s because dematerializing finishes ahead of the spring.
+    static let closeResponse = 2 * Double.pi / 21
+    static let drift: CGFloat = 3
+    static var reduced: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+    static var open: Animation { reduced ? .easeOut(duration: 0.15) : .spring(response: openResponse, dampingFraction: 1) }
+    static var close: Animation { reduced ? .easeOut(duration: 0.12) : .spring(response: closeResponse, dampingFraction: 1) }
+    static let value = Animation.spring(response: 0.3, dampingFraction: 1)
+}
+
+enum PanelMetrics {
+    static let width: CGFloat = 300
+    static let cornerRadius: CGFloat = 24
+    /// Transparent room around the card for the glass edge and shadow. Clicks there pass
+    /// through to whatever is underneath because those pixels are fully transparent.
+    static let margin = NSEdgeInsets(top: 4, left: 24, bottom: 32, right: 24)
+}
+
 @MainActor
-final class BrightnessView: NSVisualEffectView {
-    private let model: BrightnessModel
-    private let login: LoginSettings
-    private let monitorName = NSTextField(labelWithString: "External display")
-    private let valueLabel = NSTextField(labelWithString: "—%")
-    private let statusLabel = NSTextField(wrappingLabelWithString: "Connecting to monitor…")
-    private let loginError = NSTextField(wrappingLabelWithString: "")
-    private let monitorPicker = NSPopUpButton()
-    private let refreshButton = NSButton()
-    private let slider = NSSlider(value: 0, minValue: 0, maxValue: 100, target: nil, action: nil)
-    private let loginSwitch = NSSwitch()
-    private let approvalButton = NSButton(title: "Allow in Login Items settings…", target: nil, action: nil)
-    private var presets: [NSButton] = []
-    private var subscriptions = Set<AnyCancellable>()
-    private var renderQueued = false
-    var onLayout: (() -> Void)?
+final class PanelPresentation: ObservableObject {
+    @Published var visible = false
+}
 
-    init(model: BrightnessModel, login: LoginSettings) {
-        self.model = model
-        self.login = login
-        super.init(frame: .zero)
-        material = .popover
-        blendingMode = .behindWindow
-        state = .active
-        wantsLayer = true
-        layer?.cornerRadius = 18
-        layer?.masksToBounds = true
-
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 18
-        stack.detachesHiddenViews = true
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(stack)
-        NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: 370),
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -24),
-            stack.topAnchor.constraint(equalTo: topAnchor, constant: 24),
-            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -22)
-        ])
-        func add(_ view: NSView) {
-            stack.addArrangedSubview(view)
-            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        }
-        func row(_ views: [NSView], spacing: CGFloat = 10) -> NSStackView {
-            let result = NSStackView(views: views)
-            result.orientation = .horizontal
-            result.alignment = .centerY
-            result.spacing = spacing
-            return result
-        }
-        func spacer() -> NSView {
-            let view = NSView()
-            view.setContentHuggingPriority(.defaultLow, for: .horizontal)
-            return view
-        }
-        func symbol(_ name: String) -> NSImageView {
-            let image = NSImageView(image: NSImage(systemSymbolName: name, accessibilityDescription: nil)!)
-            image.contentTintColor = .secondaryLabelColor
-            image.widthAnchor.constraint(equalToConstant: 18).isActive = true
-            return image
-        }
-
-        let icon = NSImageView(image: NSApp.applicationIconImage)
-        icon.widthAnchor.constraint(equalToConstant: 40).isActive = true
-        icon.heightAnchor.constraint(equalToConstant: 40).isActive = true
-        let title = NSTextField(labelWithString: "Monitor Brightness")
-        title.font = .systemFont(ofSize: 13, weight: .semibold)
-        monitorName.font = .systemFont(ofSize: 11)
-        monitorName.textColor = .secondaryLabelColor
-        let labels = NSStackView(views: [title, monitorName])
-        labels.orientation = .vertical
-        labels.alignment = .leading
-        labels.spacing = 4
-        refreshButton.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh monitors")
-        refreshButton.isBordered = false
-        refreshButton.target = self
-        refreshButton.action = #selector(refresh)
-        refreshButton.toolTip = "Refresh connected monitors"
-        refreshButton.setAccessibilityLabel("Refresh monitors")
-        add(row([icon, labels, spacer(), refreshButton]))
-
-        monitorPicker.target = self
-        monitorPicker.action = #selector(selectMonitor)
-        monitorPicker.setAccessibilityLabel("Monitor")
-        add(monitorPicker)
-        valueLabel.font = .monospacedDigitSystemFont(ofSize: 60, weight: .light)
-        valueLabel.alignment = .center
-        add(valueLabel)
-        slider.isContinuous = true
-        slider.target = self
-        slider.action = #selector(adjustBrightness)
-        slider.setAccessibilityLabel("Monitor brightness")
-        add(row([symbol("sun.min"), slider, symbol("sun.max.fill")]))
-        presets = [25, 50, 75, 100].map { value in
-            let button = NSButton(title: "\(value)%", target: self, action: #selector(preset))
-            button.tag = value
-            button.bezelStyle = .rounded
-            button.controlSize = .small
-            button.setAccessibilityLabel("Set brightness to \(value) percent")
-            return button
-        }
-        let presetRow = row(presets)
-        presetRow.distribution = .fillEqually
-        add(presetRow)
-        statusLabel.font = .systemFont(ofSize: 11)
-        statusLabel.preferredMaxLayoutWidth = 322
-        add(statusLabel)
-        let divider = NSBox()
-        divider.boxType = .separator
-        add(divider)
-        let loginLabel = NSTextField(labelWithString: "Launch at login")
-        loginLabel.font = .systemFont(ofSize: 11)
-        loginSwitch.controlSize = .mini
-        loginSwitch.target = self
-        loginSwitch.action = #selector(toggleLogin)
-        loginSwitch.setAccessibilityLabel("Launch at login")
-        let quit = NSButton(title: "Quit", target: NSApp, action: #selector(NSApplication.terminate(_:)))
-        quit.isBordered = false
-        quit.contentTintColor = .controlAccentColor
-        quit.font = .systemFont(ofSize: 11)
-        add(row([loginLabel, loginSwitch, spacer(), quit], spacing: 8))
-        approvalButton.isBordered = false
-        approvalButton.contentTintColor = .controlAccentColor
-        approvalButton.font = .systemFont(ofSize: 11)
-        approvalButton.target = self
-        approvalButton.action = #selector(openLoginSettings)
-        add(approvalButton)
-        loginError.font = .systemFont(ofSize: 11)
-        loginError.textColor = .systemOrange
-        loginError.preferredMaxLayoutWidth = 322
-        add(loginError)
-        for publisher in [model.objectWillChange, login.objectWillChange] {
-            publisher.sink { [weak self] _ in
-                guard let self, !self.renderQueued else { return }
-                self.renderQueued = true
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    self.renderQueued = false
-                    self.render()
-                    self.onLayout?()
+/// The card's surface: Liquid Glass that materializes on macOS 26+, a plain material before.
+struct PanelSurface: ViewModifier {
+    let visible: Bool
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            GlassEffectContainer {
+                if visible {
+                    content
+                        .glassEffect(.regular, in: .rect(cornerRadius: PanelMetrics.cornerRadius))
+                        .glassEffectTransition(.materialize)
                 }
-            }.store(in: &subscriptions)
+            }
+        } else if visible {
+            content
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: PanelMetrics.cornerRadius, style: .continuous))
+                .transition(.opacity)
         }
-        render()
+    }
+}
+
+struct PanelCard: View {
+    @ObservedObject var model: BrightnessModel
+    @ObservedObject var login: LoginSettings
+    var live: Bool { model.ready || (model.loading && model.hasValue) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Text(model.displayName)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 8)
+                Text(live ? "\(Int(model.brightness.rounded()))%" : "—")
+                    .font(.system(size: 12, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .contentTransition(.numericText(value: model.brightness))
+                optionsMenu
+            }
+            .padding(.leading, 5)
+            .padding(.trailing, -2)
+
+            HStack(spacing: 6) {
+                Image(systemName: "sun.min.fill").font(.system(size: 11, weight: .medium)).frame(width: 18)
+                Slider(value: Binding(get: { model.brightness },
+                                      set: { model.setBrightness($0.rounded()) }),
+                       in: 0...100)
+                    .controlSize(.regular)
+                    .tint(Color(nsColor: NSColor(name: nil) { appearance in
+                        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .white : NSColor(white: 0.25, alpha: 1)
+                    }))
+                    .disabled(!live)
+                    .focusable(false)
+                    .accessibilityLabel("Monitor brightness")
+                Image(systemName: "sun.max.fill").font(.system(size: 15, weight: .medium)).frame(width: 18)
+            }
+            .padding(.horizontal, 2)
+            .animation(Motion.value, value: model.brightness)
+
+            if let message = model.error ?? login.error {
+                Text(message)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 5)
+            }
+            if login.needsApproval {
+                Button("Allow in Login Items Settings…") { SMAppService.openSystemSettingsLoginItems() }
+                    .buttonStyle(.link)
+                    .font(.system(size: 11))
+                    .padding(.horizontal, 5)
+            }
+        }
+        .padding(EdgeInsets(top: 12, leading: 15, bottom: 15, trailing: 15))
+        .frame(width: PanelMetrics.width, alignment: .leading)
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
-
-    private func render() {
-        monitorName.stringValue = model.selected?.name ?? "External display"
-        valueLabel.stringValue = model.ready ? "\(Int(model.brightness.rounded()))%" : "—%"
-        slider.doubleValue = model.brightness
-        slider.isEnabled = model.ready
-        presets.forEach { $0.isEnabled = model.ready }
-        refreshButton.isEnabled = !model.loading && !model.applying
-        monitorPicker.isHidden = model.monitors.count < 2
-        if monitorPicker.itemTitles != model.monitors.map(\.name) {
-            monitorPicker.removeAllItems()
-            monitorPicker.addItems(withTitles: model.monitors.map(\.name))
+    private var optionsMenu: some View {
+        let busy = model.loading || model.applying
+        return Menu {
+            if model.monitors.count > 1 {
+                Picker("Monitor", selection: Binding(get: { model.selectedID }, set: { model.select($0) })) {
+                    ForEach(model.monitors) { Text($0.name).tag($0.id) }
+                }
+                .pickerStyle(.inline)
+                .labelsHidden()
+                .disabled(busy)
+                Divider()
+            }
+            Button("Refresh") { model.refresh() }
+                .keyboardShortcut("r")
+                .disabled(busy)
+            Toggle("Launch at Login", isOn: Binding(get: { login.enabled }, set: { login.setEnabled($0) }))
+            Divider()
+            Button("Quit Monitor Brightness") { NSApp.terminate(nil) }
+                .keyboardShortcut("q")
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
         }
-        if let index = model.monitors.firstIndex(where: { $0.id == model.selectedID }) {
-            monitorPicker.selectItem(at: index)
-        }
-        monitorPicker.isEnabled = !model.loading && !model.applying
-        statusLabel.stringValue = model.error ?? (model.loading ? "Connecting to monitor…" : model.applying ? "Adjusting brightness…" : "Hardware brightness · Connected")
-        statusLabel.textColor = model.error == nil ? .secondaryLabelColor : .systemOrange
-        loginSwitch.state = login.enabled ? .on : .off
-        approvalButton.isHidden = !login.needsApproval
-        loginError.stringValue = login.error ?? ""
-        loginError.isHidden = login.error == nil
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Options")
+        .accessibilityLabel("Options")
     }
+}
 
-    @objc private func refresh() { model.refresh() }
-    @objc private func selectMonitor() {
-        let index = monitorPicker.indexOfSelectedItem
-        guard model.monitors.indices.contains(index) else { return }
-        model.select(model.monitors[index].id)
+struct PanelRoot: View {
+    @ObservedObject var presentation: PanelPresentation
+    let model: BrightnessModel
+    let login: LoginSettings
+
+    var body: some View {
+        let m = PanelMetrics.margin
+        // The hidden copy keeps the window's size stable while the visible card forms.
+        PanelCard(model: model, login: login)
+            .hidden()
+            .accessibilityHidden(true)
+            .overlay(alignment: .top) {
+                PanelCard(model: model, login: login)
+                    .modifier(PanelSurface(visible: presentation.visible))
+                    .offset(y: presentation.visible || Motion.reduced ? 0 : -Motion.drift)
+            }
+            .padding(EdgeInsets(top: m.top, leading: m.left, bottom: m.bottom, trailing: m.right))
     }
-    @objc private func adjustBrightness() { model.setBrightness(slider.doubleValue.rounded()) }
-    @objc private func preset(_ sender: NSButton) { model.setBrightness(Double(sender.tag)) }
-    @objc private func toggleLogin() { login.setEnabled(loginSwitch.state == .on) }
-    @objc private func openLoginSettings() { SMAppService.openSystemSettingsLoginItems() }
 }
 
 // Keep the panel inside its screen and below the menu bar, including screens
@@ -426,6 +420,13 @@ func panelFrame(size: NSSize, anchor: NSRect, visible: NSRect, screen: NSRect, m
     let top = min(visible.maxY, screen.maxY - menuBarHeight) - 4
     let x = max(visible.minX + 8, min(anchor.midX - size.width / 2, visible.maxX - size.width - 8))
     return NSRect(x: x, y: top - size.height, width: size.width, height: size.height)
+}
+
+/// The window around a card frame, including the transparent margin.
+func windowFrame(card: NSRect) -> NSRect {
+    let m = PanelMetrics.margin
+    return NSRect(x: card.minX - m.left, y: card.minY - m.bottom,
+                  width: card.width + m.left + m.right, height: card.height + m.top + m.bottom)
 }
 
 final class BrightnessPanel: NSPanel {
@@ -444,15 +445,21 @@ final class BrightnessPanel: NSPanel {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let model = BrightnessModel()
     let login = LoginSettings()
     var statusItem: NSStatusItem!
     private var panel: BrightnessPanel?
+    private var presentation: PanelPresentation?
+    private var hosting: NSHostingView<PanelRoot>?
     private var localMonitor: Any?
     private var globalMonitor: Any?
     private var opening = false
     private var closing = false
+    private var menuIsOpen = false
+    private var sizeObserver: AnyCancellable?
+    private var scrollRemainder = 0.0
+    private var closeGeneration = 0
     private func trace(_ message: String) {
         if CommandLine.arguments.contains("--debug-ui") {
             NSLog("MonitorBrightness UI: %@", message)
@@ -469,10 +476,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.toolTip = "Monitor Brightness"
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel)
-        NotificationCenter.default.addObserver(self, selector: #selector(displaysChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(hidePanel), name: NSApplication.didResignActiveNotification, object: nil)
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(displaysChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        center.addObserver(self, selector: #selector(hidePanel), name: NSApplication.didResignActiveNotification, object: nil)
+        // The ⋯ menu runs its own event loop; clicks in it must not dismiss the panel.
+        center.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.menuIsOpen = true }
+        }
+        center.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.menuIsOpen = false }
+        }
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(displaysChanged), name: NSWorkspace.didWakeNotification, object: nil)
         login.configureOnFirstLaunch()
+        if CommandLine.arguments.contains("--open") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.togglePanel() }
+        }
     }
 
     @objc func displaysChanged() {
@@ -484,53 +502,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func createPanel() -> BrightnessPanel {
-        let content = BrightnessView(model: model, login: login)
-        let window = BrightnessPanel(contentRect: .zero, styleMask: [.borderless],
+        let presentation = PanelPresentation()
+        let content = NSHostingView(rootView: PanelRoot(presentation: presentation, model: model, login: login))
+        content.sizingOptions = [.intrinsicContentSize]
+        // Non-activating, like Control Center: the panel takes keyboard focus without
+        // activating the app, so the front app's windows and menu bar stay as they are.
+        let window = BrightnessPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
                                      backing: .buffered, defer: false)
+        window.delegate = self
         window.title = "Monitor Brightness"
         window.isReleasedWhenClosed = false
         window.becomesKeyOnlyIfNeeded = false
         window.isOpaque = false
         window.backgroundColor = .clear
-        window.hasShadow = true
+        window.hasShadow = false // the glass draws its own edge; a window shadow can't follow it forming
         window.level = .popUpMenu
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         window.contentView = content
-        content.onLayout = { [weak self] in self?.positionPanel() }
         window.onEscape = { [weak self] in self?.hidePanel() }
+        self.presentation = presentation
+        hosting = content
+        // Error and setup lines change the card's height; follow it.
+        sizeObserver = model.objectWillChange.merge(with: login.objectWillChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.positionPanel() }
         return window
     }
 
     private func targetFrame() -> NSRect? {
         guard let button = statusItem.button, let buttonWindow = button.window,
               let screen = buttonWindow.screen ?? NSScreen.main,
-              let content = panel?.contentView else { return nil }
-        content.layoutSubtreeIfNeeded()
+              let hosting else { return nil }
+        hosting.layoutSubtreeIfNeeded()
+        let m = PanelMetrics.margin
+        let size = hosting.fittingSize
+        let card = NSSize(width: size.width - m.left - m.right, height: size.height - m.top - m.bottom)
         let anchor = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
-        return panelFrame(size: content.fittingSize, anchor: anchor, visible: screen.visibleFrame,
-                          screen: screen.frame, menuBarHeight: NSStatusBar.system.thickness)
+        return windowFrame(card: panelFrame(size: card, anchor: anchor, visible: screen.visibleFrame,
+                                            screen: screen.frame, menuBarHeight: NSStatusBar.system.thickness))
     }
 
     private func positionPanel() {
-        guard !opening, !closing, let frame = targetFrame() else { return }
-        panel?.setFrame(frame, display: true)
+        guard !closing, let panel, let frame = targetFrame(), frame != panel.frame else { return }
+        // The card is pinned to the top of the window, so resizing never moves it.
+        panel.setFrame(frame, display: true)
+    }
+
+    private func adjust(by delta: Double) {
+        guard model.ready || (model.loading && model.hasValue) else { return }
+        model.setBrightness(min(100, max(0, (model.brightness + delta).rounded())))
     }
 
     private func watchForDismissal() {
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            self?.hidePanel()
+            guard let self else { return }
+            // The menu bar delivers the status item's own click here too; togglePanel handles it.
+            if let frame = self.statusItem.button?.window?.frame, frame.contains(NSEvent.mouseLocation) { return }
+            self.trace("click outside")
+            self.hidePanel()
         }
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] event in
-            guard let self, let panel = self.panel, panel.isVisible else { return event }
-            if event.type == .keyDown && event.keyCode == 53 {
-                self.trace("Escape received keyWindow=\(panel.isKeyWindow)")
-                self.hidePanel()
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown, .scrollWheel]) { [weak self] event in
+            guard let self, let panel = self.panel, panel.isVisible, !self.menuIsOpen else { return event }
+            switch event.type {
+            case .keyDown:
+                let step = event.modifierFlags.contains(.option) ? 1.0 : 5.0
+                switch event.keyCode {
+                case 53: self.hidePanel(); return nil
+                case 123, 125: self.adjust(by: -step); return nil
+                case 124, 126: self.adjust(by: step); return nil
+                default: return event
+                }
+            case .scrollWheel where event.window === panel:
+                // Physical "up" brightens regardless of the natural scrolling setting.
+                let delta = Double(event.scrollingDeltaY) * (event.isDirectionInvertedFromDevice ? -1 : 1)
+                self.scrollRemainder += delta * (event.hasPreciseScrollingDeltas ? 0.25 : 2)
+                let steps = self.scrollRemainder.rounded(.towardZero)
+                if steps != 0 {
+                    self.scrollRemainder -= steps
+                    self.adjust(by: steps)
+                }
                 return nil
+            case .leftMouseDown, .rightMouseDown:
+                if event.window !== panel && event.window !== self.statusItem.button?.window {
+                    self.hidePanel()
+                }
+                return event
+            default:
+                return event
             }
-            if event.type != .keyDown && event.window !== panel && event.window !== self.statusItem.button?.window {
-                self.hidePanel()
-            }
-            return event
         }
     }
 
@@ -538,57 +597,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let panel, !closing else { return }
         trace("dismiss requested")
         closing = true
+        statusItem.button?.highlight(false)
         if let localMonitor { NSEvent.removeMonitor(localMonitor); self.localMonitor = nil }
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor); self.globalMonitor = nil }
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.10
-            panel.animator().alphaValue = 0
-        } completionHandler: { [weak self, weak panel] in
-            Task { @MainActor in
-                guard let self else { return }
-                panel?.orderOut(nil)
-                panel?.contentView = nil
-                panel?.close()
-                self.panel = nil
-                self.opening = false
-                self.closing = false
-                self.trace("dismissed visible=\(panel?.isVisible ?? false) panelReleased=\(self.panel == nil)")
-            }
+        panel.ignoresMouseEvents = true
+        closeGeneration += 1
+        let generation = closeGeneration
+        withAnimation(Motion.close, completionCriteria: .logicallyComplete) {
+            presentation?.visible = false
+        } completion: { [weak self, weak panel] in
+            // Skip if the panel was reopened mid-close, or closed again since.
+            guard let self, self.closing, self.closeGeneration == generation else { return }
+            panel?.orderOut(nil)
+            panel?.contentView = nil
+            panel?.close()
+            self.panel = nil
+            self.presentation = nil
+            self.hosting = nil
+            self.sizeObserver = nil
+            self.opening = false
+            self.closing = false
+            self.trace("dismissed panelReleased=\(self.panel == nil)")
         }
     }
 
     @objc func togglePanel() {
-        if closing { return }
+        if closing { reopen(); return }
         if panel != nil { hidePanel(); return }
         model.refresh()
         login.refresh()
         let window = createPanel()
         panel = window
         guard let frame = targetFrame() else { panel = nil; return }
-        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        window.setFrame(frame.offsetBy(dx: 0, dy: reduceMotion ? 0 : -6), display: false)
-        window.alphaValue = 0
+        window.setFrame(frame, display: false)
         opening = true
-        NSApp.activate(ignoringOtherApps: true)
+        statusItem.button?.highlight(true)
         window.makeKeyAndOrderFront(nil)
-        window.makeFirstResponder(window)
         watchForDismissal()
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = reduceMotion ? 0.10 : 0.18
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            window.animator().alphaValue = 1
-            window.animator().setFrame(frame, display: true)
-        } completionHandler: { [weak self, weak window] in
-            Task { @MainActor in
-                guard let self, let window, self.panel === window else { return }
-                self.opening = false
-                self.positionPanel()
-                if !self.closing {
-                    window.makeKey()
-                    self.trace("opened visible=\(window.isVisible) keyWindow=\(window.isKeyWindow)")
-                }
+        // Let the empty window reach the screen first so the card visibly forms on it.
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window, self.panel === window, !self.closing else { return }
+            withAnimation(Motion.open) {
+                self.presentation?.visible = true
+            } completion: { [weak self] in
+                self?.opening = false
+                self?.trace("opened keyWindow=\(window.isKeyWindow) frame=\(NSStringFromRect(window.frame))")
             }
         }
+    }
+
+    /// Clicking the icon while the panel dissolves forms it again from where it is.
+    private func reopen() {
+        guard let panel else { return }
+        trace("reopen during close")
+        closing = false
+        opening = true
+        panel.ignoresMouseEvents = false
+        statusItem.button?.highlight(true)
+        panel.makeKeyAndOrderFront(nil)
+        watchForDismissal()
+        withAnimation(Motion.open) {
+            presentation?.visible = true
+        } completion: { [weak self] in
+            self?.opening = false
+        }
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        // Another app or window took focus (Command-Tab, Mission Control, …).
+        guard (notification.object as? NSWindow) === panel, !opening, !menuIsOpen else { return }
+        trace("resigned key")
+        hidePanel()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -641,6 +720,10 @@ if CommandLine.arguments.contains("--login-status") {
         }
     }
     print("Panel stays below the menu bar and inside either screen edge")
+    let card = NSRect(x: 100, y: 500, width: 300, height: 75)
+    let window = windowFrame(card: card)
+    precondition(window.maxY == card.maxY + PanelMetrics.margin.top && window.minX == card.minX - PanelMetrics.margin.left)
+    print("Window margin surrounds the card without moving it")
     print("All checks passed")
 } else {
     MainActor.assumeIsolated {

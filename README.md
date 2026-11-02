@@ -1,6 +1,6 @@
 # Monitor Brightness
 
-Control your external monitor's brightness from the Mac menu bar. Drag the slider or choose a preset. The app changes the monitor's hardware backlight.
+Control your external monitor's brightness from the Mac menu bar with a slider in a Control Center–style glass panel. The app changes the monitor's hardware backlight.
 
 Coworkers with the same monitor can follow the steps below to build and install their own copy. The app detects each monitor, so no device IDs or code changes are needed.
 
@@ -60,9 +60,11 @@ Build on the Mac where you plan to use the app. The build signs the app locally.
 
 ## Use the app
 
-Click the sun icon at the top right of your screen. A rounded panel opens just below the menu bar and shows your monitor's name and current brightness. Move the slider or click 25%, 50%, 75%, or 100%. If multiple compatible monitors are connected, select the one you want to adjust.
+Click the sun icon at the top right of your screen. A glass panel opens just below the menu bar and shows your monitor's name, its current brightness, and a slider. Click or drag the slider, scroll over it, or press the arrow keys to change brightness in 5% steps. Hold Option with an arrow key for 1% steps.
 
-Press Escape, click outside the panel, or click the sun icon again to close it. The app stays in the menu bar and does not appear in the Dock. Click Quit in the panel to exit.
+Press Escape, click outside the panel, or click the sun icon again to close it. Opening the panel does not switch apps, so the app you are using stays active. The app stays in the menu bar and does not appear in the Dock.
+
+Click the ⋯ button in the panel for more options: choose a monitor when more than one compatible monitor is connected, Refresh, Launch at Login, and Quit.
 
 Refresh rescans monitors and reads their current brightness. The app also reconnects after sleep or display changes. It does not change brightness on launch. The monitor keeps its last brightness setting after you quit.
 
@@ -72,7 +74,7 @@ The app controls external monitors. It does not control the MacBook's built-in s
 
 The installed app enables Launch at login the first time you open it. After you sign in to your Mac, the sun icon appears in the menu bar. The panel stays closed until you click it.
 
-Use the Launch at login switch in the panel to turn this off or on. If macOS needs approval, the panel shows a link to Login Items settings. Allow Monitor Brightness there to finish setup.
+Choose Launch at Login from the panel's ⋯ menu to turn this off or on. If macOS needs approval, the panel shows a link to Login Items settings. Allow Monitor Brightness there to finish setup.
 
 Install the app in `~/Applications` before enabling this setting. The app does not register a temporary build copy for automatic startup.
 
@@ -80,11 +82,11 @@ Install the app in `~/Applications` before enabling this setting. The app does n
 
 The app uses native macOS controls. It creates the panel when you open it and releases the panel and its mouse listeners when you close it. It does not poll monitors or run a background timer. The monitor-control helper runs only when a read or adjustment is needed.
 
-The panel opens with a short fade and slide. If Reduce Motion is enabled in macOS, it uses a fade without movement.
+The panel uses Liquid Glass on macOS 26 and later, and a translucent material on earlier versions. Like Control Center, the glass materializes when the panel opens and dissolves when it closes, on spring timing measured from Control Center. Clicking the sun icon while the panel dissolves brings it back. The slider eases to new values. The panel shows the last known brightness right away while it re-reads the monitor. If Reduce Motion is enabled in macOS, the panel fades without movement and the slider changes without animation.
 
 ## Update your copy
 
-Click the sun icon and choose Quit first. Closing the panel is not enough. Then run:
+Click the sun icon, then choose Quit from the ⋯ menu first. Closing the panel is not enough. Then run:
 
 ```sh
 cd "$HOME/Developer/monitor-brightness"
@@ -129,7 +131,7 @@ The software checks cover display parsing, failed commands, command timeouts, an
 
 ## Uninstall
 
-Turn off Launch at login in the panel and quit the app, then move `~/Applications/Monitor Brightness.app` to Trash in Finder. You can also move `~/Developer/monitor-brightness` to Trash if you no longer need the source.
+Turn off Launch at Login in the panel's ⋯ menu and quit the app, then move `~/Applications/Monitor Brightness.app` to Trash in Finder. You can also move `~/Developer/monitor-brightness` to Trash if you no longer need the source.
 
 ## Third-party source
 
