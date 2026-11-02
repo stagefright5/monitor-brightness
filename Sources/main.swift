@@ -277,6 +277,249 @@ enum PanelMetrics {
     static let margin = NSEdgeInsets(top: 4, left: 24, bottom: 32, right: 24)
 }
 
+/// macOS font smoothing ("AppleFontSmoothing" in the current host's global domain).
+/// Smoothing thickens glyph stems; it suits Retina screens but softens text at ~90 PPI.
+@MainActor
+final class TextSmoothing: ObservableObject {
+    private static let key = "AppleFontSmoothing" as CFString
+    /// What running apps, including this one, were launched with.
+    let sharperAtLaunch: Bool
+    @Published private(set) var sharper: Bool
+
+    init() {
+        let current = Self.read() == 0
+        sharper = current
+        sharperAtLaunch = current
+    }
+
+    static func read() -> Int? {
+        CFPreferencesCopyValue(key, kCFPreferencesAnyApplication, kCFPreferencesCurrentUser,
+                               kCFPreferencesCurrentHost) as? Int
+    }
+
+    func setSharper(_ value: Bool) {
+        CFPreferencesSetValue(Self.key, (value ? 0 : 1) as CFNumber, kCFPreferencesAnyApplication,
+                              kCFPreferencesCurrentUser, kCFPreferencesCurrentHost)
+        CFPreferencesSynchronize(kCFPreferencesAnyApplication, kCFPreferencesCurrentUser, kCFPreferencesCurrentHost)
+        sharper = Self.read() == 0
+    }
+}
+
+/// Sample text drawn with or without font smoothing, so the setting can be compared
+/// immediately. Smoothing only applies on an opaque background, hence the filled well.
+final class SmoothingSampleView: NSView {
+    var smooth = true { didSet { needsDisplay = true } }
+    override var isOpaque: Bool { true }
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 26) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        NSColor.textBackgroundColor.setFill()
+        bounds.fill()
+        context.setAllowsFontSmoothing(true)
+        context.setShouldSmoothFonts(smooth)
+        let text = "The quick brown fox jumps over the lazy dog" as NSString
+        let font = NSFont.systemFont(ofSize: 12)
+        let y = ((bounds.height - font.ascender + font.descender) / 2).rounded()
+        text.draw(at: NSPoint(x: 8, y: y), withAttributes: [.font: font, .foregroundColor: NSColor.labelColor])
+    }
+}
+
+struct SmoothingSample: NSViewRepresentable {
+    let smooth: Bool
+    func makeNSView(context: Context) -> SmoothingSampleView {
+        let view = SmoothingSampleView()
+        view.wantsLayer = true
+        view.layer?.cornerRadius = 7
+        view.layer?.cornerCurve = .continuous
+        view.layer?.masksToBounds = true
+        view.smooth = smooth
+        return view
+    }
+    func updateNSView(_ view: SmoothingSampleView, context: Context) { view.smooth = smooth }
+}
+
+/// HiDPI for a low-density external monitor: macOS draws onto a virtual HiDPI display at
+/// twice the monitor's resolution, and the monitor mirrors it, scaled down. The virtual
+/// display lives only as long as this app, so quitting or crashing restores the normal
+/// setup on its own. Uses CoreGraphics' private CGVirtualDisplay, as display utilities do.
+/// HiDPI on a Mac is always 2×, so drawing more pixels means a larger desktop: each level
+/// widens what the monitor "looks like" and doubles that for drawing.
+struct HiDPILevel {
+    let label: String
+    let factor: Double
+    static let all = [HiDPILevel(label: "4K", factor: 1), HiDPILevel(label: "4.5K", factor: 7.0 / 6.0),
+                      HiDPILevel(label: "5K", factor: 4.0 / 3.0)]
+}
+
+/// The desktop size, in points, for a monitor's native pixels at a level (kept even).
+func hiDPILooksLike(nativeWidth: Int, nativeHeight: Int, factor: Double) -> (width: Int, height: Int) {
+    func even(_ value: Double) -> Int { Int((value / 2).rounded()) * 2 }
+    return (even(Double(nativeWidth) * factor), even(Double(nativeHeight) * factor))
+}
+
+@MainActor
+final class HiDPIController: ObservableObject {
+    static let vendorID: UInt32 = 0xF0F0
+    @Published private(set) var enabled = UserDefaults.standard.bool(forKey: "hiDPI")
+    @Published private(set) var level = min(max(UserDefaults.standard.integer(forKey: "hiDPILevel"), 0), HiDPILevel.all.count - 1)
+    /// What the active virtual display looks like and draws at, for the panel.
+    @Published private(set) var summary: String?
+    @Published private(set) var error: String?
+    /// When the user last switched HiDPI or its size; the display rebuild that follows
+    /// briefly takes focus from the panel, which shouldn't close it.
+    private(set) var changedAt: Date?
+    var isReconfiguring: Bool { changedAt.map { Date().timeIntervalSince($0) < 3 } ?? false }
+    private var display: CGVirtualDisplay?
+    private var target: CGDirectDisplayID?
+    /// True while the new virtual display is registering; display-change callbacks wait.
+    private var starting = false
+
+    func start() { if enabled { apply() } }
+
+    func setEnabled(_ value: Bool) {
+        enabled = value
+        changedAt = Date()
+        UserDefaults.standard.set(value, forKey: "hiDPI")
+        error = nil
+        value ? apply() : tearDown()
+    }
+
+    func setLevel(_ value: Int) {
+        guard value != level, HiDPILevel.all.indices.contains(value) else { return }
+        level = value
+        changedAt = Date()
+        UserDefaults.standard.set(value, forKey: "hiDPILevel")
+        guard enabled else { return }
+        tearDown()
+        apply()
+    }
+
+    /// The external monitor to enhance: not built in, not our own virtual display.
+    static func externalDisplay() -> CGDirectDisplayID? {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        CGGetOnlineDisplayList(16, &ids, &count)
+        let external = ids.prefix(Int(count)).filter {
+            CGDisplayIsBuiltin($0) == 0 && CGDisplayVendorNumber($0) != vendorID
+        }
+        return external.first { CGDisplayIsMain($0) != 0 || CGDisplayMirrorsDisplay($0) != kCGNullDirectDisplay }
+            ?? external.first
+    }
+
+    private func apply() {
+        guard let physical = Self.externalDisplay() else {
+            tearDown()
+            error = "Connect an external monitor to use HiDPI."
+            return
+        }
+        if starting { return }
+        if let display, target == physical {
+            // Already set up; only restore the mirror if the system dropped it.
+            if CGDisplayMirrorsDisplay(physical) != display.displayID { mirror(physical, to: display.displayID) }
+            return
+        }
+        tearDown()
+        // Size the virtual display from the monitor's native mode, at twice the pixels.
+        let native = (CGDisplayCopyAllDisplayModes(physical, nil) as? [CGDisplayMode] ?? [])
+            .filter { $0.isUsableForDesktopGUI() }
+            .max { $0.pixelWidth * $0.pixelHeight < $1.pixelWidth * $1.pixelHeight }
+            ?? CGDisplayCopyDisplayMode(physical)
+        guard let native else { error = "Couldn’t read this monitor’s resolution."; return }
+        let size = hiDPILooksLike(nativeWidth: native.pixelWidth, nativeHeight: native.pixelHeight,
+                                  factor: HiDPILevel.all[level].factor)
+        let width = UInt32(size.width), height = UInt32(size.height)
+        let refresh = native.refreshRate > 0 ? native.refreshRate : 60
+
+        let descriptor = CGVirtualDisplayDescriptor()
+        descriptor.queue = .main
+        descriptor.name = "HiDPI " + (NSScreen.screens.first { $0.displayID == physical }?.localizedName ?? "Display")
+        descriptor.maxPixelsWide = width * 2
+        descriptor.maxPixelsHigh = height * 2
+        descriptor.sizeInMillimeters = CGDisplayScreenSize(physical)
+        descriptor.vendorID = Self.vendorID
+        descriptor.productID = CGDisplayModelNumber(physical)
+        descriptor.serialNum = CGDisplaySerialNumber(physical)
+        descriptor.terminationHandler = { _, _ in }
+        guard let display = CGVirtualDisplay(descriptor: descriptor) else {
+            error = "macOS didn’t allow a HiDPI display."
+            return
+        }
+        let settings = CGVirtualDisplaySettings()
+        settings.hiDPI = 1
+        guard let mode = CGVirtualDisplayMode(width: width, height: height, refreshRate: refresh) else { return }
+        settings.modes = [mode]
+        guard display.apply(settings) else {
+            error = "macOS didn’t allow a HiDPI display."
+            return
+        }
+        self.display = display
+        target = physical
+        summary = "Looks like \(width)×\(height) · draws at \(width * 2)×\(height * 2)"
+        starting = true
+        waitThenMirror(physical, to: display.displayID, attempts: 30)
+    }
+
+    /// The window server registers a new display asynchronously.
+    private func waitThenMirror(_ physical: CGDirectDisplayID, to virtual: CGDirectDisplayID, attempts: Int) {
+        guard display?.displayID == virtual else { starting = false; return }
+        if CGDisplayCopyDisplayMode(virtual) != nil {
+            starting = false
+            mirror(physical, to: virtual)
+        } else if attempts > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.waitThenMirror(physical, to: virtual, attempts: attempts - 1)
+            }
+        } else {
+            starting = false
+            tearDown()
+            error = "The HiDPI display didn’t start. Try again."
+        }
+    }
+
+    private func mirror(_ physical: CGDirectDisplayID, to virtual: CGDirectDisplayID) {
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success else { return }
+        CGConfigureDisplayMirrorOfDisplay(config, physical, virtual)
+        if CGCompleteDisplayConfiguration(config, .forSession) != .success {
+            CGCancelDisplayConfiguration(config)
+            error = "Couldn’t mirror the monitor to the HiDPI display."
+        }
+    }
+
+    private func tearDown() {
+        if let target, let display, CGDisplayMirrorsDisplay(target) == display.displayID {
+            var config: CGDisplayConfigRef?
+            if CGBeginDisplayConfiguration(&config) == .success {
+                CGConfigureDisplayMirrorOfDisplay(config, target, kCGNullDirectDisplay)
+                CGCompleteDisplayConfiguration(config, .forSession)
+            }
+        }
+        // Releasing the virtual display removes it; macOS restores the previous arrangement.
+        starting = false
+        display = nil
+        target = nil
+        summary = nil
+    }
+
+    /// Called on display changes: follow the monitor, and never leave the virtual display
+    /// behind without it (a laptop screen would otherwise mirror a blurry HiDPI copy).
+    func displaysChanged() {
+        guard enabled else { return }
+        if Self.externalDisplay() == nil {
+            tearDown()
+        } else {
+            apply()
+        }
+    }
+}
+
+extension NSScreen {
+    var displayID: CGDirectDisplayID? {
+        (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+    }
+}
+
 @MainActor
 final class PanelPresentation: ObservableObject {
     @Published var visible = false
@@ -305,6 +548,8 @@ struct PanelSurface: ViewModifier {
 struct PanelCard: View {
     @ObservedObject var model: BrightnessModel
     @ObservedObject var login: LoginSettings
+    @ObservedObject var smoothing: TextSmoothing
+    @ObservedObject var hiDPI: HiDPIController
     var live: Bool { model.ready || (model.loading && model.hasValue) }
 
     var body: some View {
@@ -340,6 +585,62 @@ struct PanelCard: View {
             }
             .padding(.horizontal, 2)
             .animation(Motion.value, value: model.brightness)
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Sharper text").font(.system(size: 12))
+                    Spacer()
+                    Toggle("Sharper text", isOn: Binding(get: { smoothing.sharper },
+                                                         set: { smoothing.setSharper($0) }))
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .labelsHidden()
+                }
+                .padding(.horizontal, 5)
+                HStack {
+                    Text("HiDPI").font(.system(size: 12))
+                    Spacer()
+                    Toggle("HiDPI", isOn: Binding(get: { hiDPI.enabled }, set: { hiDPI.setEnabled($0) }))
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .labelsHidden()
+                }
+                .padding(.horizontal, 5)
+                .help("Draw at twice the monitor’s resolution and scale down to fit.")
+                if hiDPI.enabled {
+                    Picker("HiDPI size", selection: Binding(get: { hiDPI.level }, set: { hiDPI.setLevel($0) })) {
+                        ForEach(HiDPILevel.all.indices, id: \.self) { Text(HiDPILevel.all[$0].label).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .fixedSize()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 5)
+                    if let summary = hiDPI.summary {
+                        Text(summary)
+                            .font(.system(size: 11).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5)
+                    }
+                }
+                if let error = hiDPI.error {
+                    Text(error)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 5)
+                }
+                SmoothingSample(smooth: !smoothing.sharper)
+                    .frame(height: 26)
+                    .accessibilityHidden(true)
+                if smoothing.sharper != smoothing.sharperAtLaunch {
+                    Text("Other apps update when reopened.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 5)
+                }
+            }
+            .padding(.top, 2)
 
             if let message = model.error ?? login.error {
                 Text(message)
@@ -398,15 +699,17 @@ struct PanelRoot: View {
     @ObservedObject var presentation: PanelPresentation
     let model: BrightnessModel
     let login: LoginSettings
+    let smoothing: TextSmoothing
+    let hiDPI: HiDPIController
 
     var body: some View {
         let m = PanelMetrics.margin
         // The hidden copy keeps the window's size stable while the visible card forms.
-        PanelCard(model: model, login: login)
+        PanelCard(model: model, login: login, smoothing: smoothing, hiDPI: hiDPI)
             .hidden()
             .accessibilityHidden(true)
             .overlay(alignment: .top) {
-                PanelCard(model: model, login: login)
+                PanelCard(model: model, login: login, smoothing: smoothing, hiDPI: hiDPI)
                     .modifier(PanelSurface(visible: presentation.visible))
                     .offset(y: presentation.visible || Motion.reduced ? 0 : -Motion.drift)
             }
@@ -448,6 +751,8 @@ final class BrightnessPanel: NSPanel {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let model = BrightnessModel()
     let login = LoginSettings()
+    let smoothing = TextSmoothing()
+    let hiDPI = HiDPIController()
     var statusItem: NSStatusItem!
     private var panel: BrightnessPanel?
     private var presentation: PanelPresentation?
@@ -488,22 +793,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(displaysChanged), name: NSWorkspace.didWakeNotification, object: nil)
         login.configureOnFirstLaunch()
+        hiDPI.start()
         if CommandLine.arguments.contains("--open") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.togglePanel() }
         }
     }
 
     @objc func displaysChanged() {
+        hiDPI.displaysChanged()
         // Read hardware only while controls are visible. Opening always rescans.
         if panel?.isVisible == true {
             model.refresh()
             positionPanel()
+            if hiDPI.isReconfiguring { panel?.makeKeyAndOrderFront(nil) }
         }
     }
 
     private func createPanel() -> BrightnessPanel {
         let presentation = PanelPresentation()
-        let content = NSHostingView(rootView: PanelRoot(presentation: presentation, model: model, login: login))
+        let content = NSHostingView(rootView: PanelRoot(presentation: presentation, model: model, login: login, smoothing: smoothing, hiDPI: hiDPI))
         content.sizingOptions = [.intrinsicContentSize]
         // Non-activating, like Control Center: the panel takes keyboard focus without
         // activating the app, so the front app's windows and menu bar stay as they are.
@@ -523,7 +831,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         self.presentation = presentation
         hosting = content
         // Error and setup lines change the card's height; follow it.
-        sizeObserver = model.objectWillChange.merge(with: login.objectWillChange)
+        sizeObserver = model.objectWillChange.merge(with: login.objectWillChange, smoothing.objectWillChange, hiDPI.objectWillChange)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.positionPanel() }
         return window
@@ -584,6 +892,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 return nil
             case .leftMouseDown, .rightMouseDown:
                 if event.window !== panel && event.window !== self.statusItem.button?.window {
+                    self.trace("mouse down in other window: \(String(describing: event.window)) level=\(event.window?.level.rawValue ?? -1) parent=\(String(describing: event.window?.parent))")
                     self.hidePanel()
                 }
                 return event
@@ -666,7 +975,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowDidResignKey(_ notification: Notification) {
         // Another app or window took focus (Command-Tab, Mission Control, …).
         guard (notification.object as? NSWindow) === panel, !opening, !menuIsOpen else { return }
-        trace("resigned key")
+        if hiDPI.isReconfiguring {
+            // Displays are being rebuilt; take focus back once they settle.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self, let panel = self.panel, !self.closing else { return }
+                self.positionPanel()
+                panel.makeKeyAndOrderFront(nil)
+            }
+            return
+        }
+        trace("resigned key; app active=\(NSApp.isActive) key=\(String(describing: NSApp.keyWindow)) front=\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "?") event=\(String(describing: NSApp.currentEvent?.type)) window=\(String(describing: NSApp.currentEvent?.window))")
         hidePanel()
     }
 
@@ -724,6 +1042,10 @@ if CommandLine.arguments.contains("--login-status") {
     let window = windowFrame(card: card)
     precondition(window.maxY == card.maxY + PanelMetrics.margin.top && window.minX == card.minX - PanelMetrics.margin.left)
     print("Window margin surrounds the card without moving it")
+    precondition(hiDPILooksLike(nativeWidth: 1920, nativeHeight: 1080, factor: HiDPILevel.all[0].factor) == (1920, 1080))
+    precondition(hiDPILooksLike(nativeWidth: 1920, nativeHeight: 1080, factor: HiDPILevel.all[1].factor) == (2240, 1260))
+    precondition(hiDPILooksLike(nativeWidth: 1920, nativeHeight: 1080, factor: HiDPILevel.all[2].factor) == (2560, 1440))
+    print("HiDPI levels draw at 3840×2160, 4480×2520 and 5120×2880 on a 1080p monitor")
     print("All checks passed")
 } else {
     MainActor.assumeIsolated {

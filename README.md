@@ -64,6 +64,10 @@ Click the sun icon at the top right of your screen. A glass panel opens just bel
 
 Press Escape, click outside the panel, or click the sun icon again to close it. Opening the panel does not switch apps, so the app you are using stays active. The app stays in the menu bar and does not appear in the Dock.
 
+The Sharper text switch turns macOS font smoothing off or on for your user account. Smoothing thickens text, which suits Retina screens but can look soft on a 1080p monitor. The sample line under the switch changes immediately so you can compare. Other apps use the new setting the next time you open them.
+
+The HiDPI switch makes macOS draw at twice the monitor's resolution (3840×2160 for a 1080p monitor) and scale the result down to fit. Text and icons are drawn from Retina-quality detail, which can look smoother on a low-density monitor. It works by creating a virtual HiDPI display, mirroring the monitor to it, and keeping it while the app runs. Quitting the app returns the monitor to its normal mode. The app removes the virtual display if the monitor is disconnected. Choose 4K, 4.5K, or 5K under the switch. HiDPI on a Mac is always exactly 2×, so drawing more than 4K means a larger desktop: on a 1080p monitor, 4.5K looks like 2240×1260 and 5K looks like 2560×1440, which makes text and controls about 14% and 25% smaller. macOS rearranges open windows when the desktop size changes. Screenshots are taken at the drawing size while HiDPI is on. This uses an undocumented macOS interface that display utilities also rely on, so a future macOS update could break it.
+
 Click the ⋯ button in the panel for more options: choose a monitor when more than one compatible monitor is connected, Refresh, Launch at Login, and Quit.
 
 Refresh rescans monitors and reads their current brightness. The app also reconnects after sleep or display changes. It does not change brightness on launch. The monitor keeps its last brightness setting after you quit.

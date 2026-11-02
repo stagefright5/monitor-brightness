@@ -8,7 +8,7 @@ cp vendor/m1ddc/m1ddc "$APP/Contents/Helpers/m1ddc"
 cp vendor/m1ddc/LICENSE "$APP/Contents/Resources/m1ddc-LICENSE.txt"
 xcrun swift Tools/generate-icon.swift "$PWD/build"
 iconutil -c icns "$PWD/build/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
-xcrun swiftc -O -swift-version 5 -target arm64-apple-macos14.0 Sources/main.swift -o "$APP/Contents/MacOS/MonitorBrightness" -framework AppKit -framework SwiftUI -framework QuartzCore -framework ServiceManagement
+xcrun swiftc -O -swift-version 5 -target arm64-apple-macos14.0 -import-objc-header Sources/VirtualDisplay.h Sources/main.swift -o "$APP/Contents/MacOS/MonitorBrightness" -framework AppKit -framework SwiftUI -framework QuartzCore -framework ServiceManagement
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
