@@ -1,6 +1,6 @@
 # Monitor Brightness
 
-Control your HP M24f FHD monitor's brightness from a Mac app or the menu bar. Drag the slider or choose a preset. The app changes the monitor's hardware backlight.
+Control your external monitor's brightness from the Mac menu bar. Drag the slider or choose a preset. The app changes the monitor's hardware backlight.
 
 Coworkers with the same monitor can follow the steps below to build and install their own copy. The app detects each monitor, so no device IDs or code changes are needed.
 
@@ -14,7 +14,7 @@ You need:
 
 Check your Mac's chip and macOS version in Apple menu > About This Mac. Intel Macs, Windows, and Linux are not supported.
 
-The same monitor can behave differently through a dock or adapter. The connection must support DDC/CI, the protocol the app uses to change brightness.
+Other monitor brands can work too if they support brightness control over DDC/CI. The app checks each connected monitor; it does not depend on an HP model or a fixed device ID. The same monitor can behave differently through a dock or adapter. The connection must support DDC/CI, the protocol the app uses to change brightness.
 
 ## Build and install
 
@@ -60,17 +60,31 @@ Build on the Mac where you plan to use the app. The build signs the app locally.
 
 ## Use the app
 
-Your monitor's name and current brightness appear when it connects. Move the slider or click 25%, 50%, 75%, or 100%. If multiple compatible monitors are connected, select the one you want to adjust.
+Click the sun icon at the top right of your screen. A rounded panel opens just below the menu bar and shows your monitor's name and current brightness. Move the slider or click 25%, 50%, 75%, or 100%. If multiple compatible monitors are connected, select the one you want to adjust.
 
-Click the sun icon in the menu bar to open the same controls. Closing the window leaves the menu-bar control running. Click Quit or press Command-Q while the app is active to exit.
+Press Escape, click outside the panel, or click the sun icon again to close it. The app stays in the menu bar and does not appear in the Dock. Click Quit in the panel to exit.
 
-Refresh rescans monitors and reads their current brightness. The app also reconnects after sleep or display changes. It does not change brightness on launch or start automatically at login. The monitor keeps its last brightness setting after you quit.
+Refresh rescans monitors and reads their current brightness. The app also reconnects after sleep or display changes. It does not change brightness on launch. The monitor keeps its last brightness setting after you quit.
 
 The app controls external monitors. It does not control the MacBook's built-in screen or request Accessibility or Screen Recording access.
 
+## Launch at login
+
+The installed app enables Launch at login the first time you open it. After you sign in to your Mac, the sun icon appears in the menu bar. The panel stays closed until you click it.
+
+Use the Launch at login switch in the panel to turn this off or on. If macOS needs approval, the panel shows a link to Login Items settings. Allow Monitor Brightness there to finish setup.
+
+Install the app in `~/Applications` before enabling this setting. The app does not register a temporary build copy for automatic startup.
+
+## Resource use
+
+The app uses native macOS controls. It creates the panel when you open it and releases the panel and its mouse listeners when you close it. It does not poll monitors or run a background timer. The monitor-control helper runs only when a read or adjustment is needed.
+
+The panel opens with a short fade and slide. If Reduce Motion is enabled in macOS, it uses a fade without movement.
+
 ## Update your copy
 
-Quit the app first. Closing its window is not enough. Then run:
+Click the sun icon and choose Quit first. Closing the panel is not enough. Then run:
 
 ```sh
 cd "$HOME/Developer/monitor-brightness"
@@ -111,12 +125,14 @@ To read the connected monitors' brightness from Terminal:
 "build/Monitor Brightness.app/Contents/MacOS/MonitorBrightness" --check
 ```
 
-The software checks cover display parsing, failed commands, and command timeouts. They do not prove that a particular monitor connection supports brightness control.
+The software checks cover display parsing, failed commands, command timeouts, and panel placement on multiple screen layouts. They do not prove that a particular monitor connection supports brightness control.
 
 ## Uninstall
 
-Quit the app, then move `~/Applications/Monitor Brightness.app` to Trash in Finder. You can also move `~/Developer/monitor-brightness` to Trash if you no longer need the source.
+Turn off Launch at login in the panel and quit the app, then move `~/Applications/Monitor Brightness.app` to Trash in Finder. You can also move `~/Developer/monitor-brightness` to Trash if you no longer need the source.
 
 ## Third-party source
 
 The app bundles the MIT-licensed [m1ddc](https://github.com/waydabber/m1ddc) helper at commit `7339ceebb03f691b1eaeb8471dca301d215d19c8`. Its license is in `vendor/m1ddc/LICENSE` and in the app bundle. The helper uses macOS display interfaces that may change in future OS releases.
+
+The build draws the app icon at each required size using `Tools/generate-icon.swift`. The menu bar uses a monochrome sun symbol that follows the system appearance.
