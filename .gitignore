@@ -1,0 +1,4 @@
+build/
+.DS_Store
+vendor/m1ddc/.objects/
+vendor/m1ddc/m1ddc
