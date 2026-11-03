@@ -1,6 +1,6 @@
 # Monitor Brightness
 
-Control your external monitor's brightness from the Mac menu bar with a slider in a Control Center–style glass panel. The app changes the monitor's hardware backlight.
+Control your external monitor's brightness from the Mac menu bar with a slider in a Control Center–style glass panel. The app changes the monitor's hardware backlight when the monitor supports it, and dims the picture in software when it doesn't.
 
 Coworkers with the same monitor can follow the steps below to build and install their own copy. The app detects each monitor, so no device IDs or code changes are needed.
 
@@ -9,12 +9,14 @@ Coworkers with the same monitor can follow the steps below to build and install 
 You need:
 
 - An Apple Silicon Mac, such as an M1, M2, or M3, running macOS 14 or later.
-- An external monitor connected to the Mac. This app has been tested with an HP M24f FHD on an M3 Pro.
+- An external monitor connected to the Mac. This app has been tested with an HP M24f FHD (hardware brightness) and an ARZOPA portable monitor over HDMI (software dimming) on an M3 Pro.
 - Apple's Command Line Tools to build the app.
 
 Check your Mac's chip and macOS version in Apple menu > About This Mac. Intel Macs, Windows, and Linux are not supported.
 
-Other monitor brands can work too if they support brightness control over DDC/CI. The app checks each connected monitor; it does not depend on an HP model or a fixed device ID. The same monitor can behave differently through a dock or adapter. The connection must support DDC/CI, the protocol the app uses to change brightness.
+Other monitor brands can work too if they support brightness control over DDC/CI. The app checks each connected monitor; it does not depend on an HP model or a fixed device ID. The same monitor can behave differently through a dock or adapter. Hardware brightness needs DDC/CI, the protocol the app uses to change the backlight, on both the monitor and the connection.
+
+Monitors that don't answer DDC/CI, such as many portable monitors, still get a slider. For those the app dims the picture by scaling the display's gamma, and the panel says so. Software dimming darkens the image rather than the backlight, so it doesn't save power, and it stops at 10% of normal output so the screen never goes black. macOS undoes it when the app quits, so the app remembers each monitor's level and reapplies it at launch, after sleep and after display changes.
 
 ## Build and install
 
@@ -68,9 +70,9 @@ The Sharper text switch turns macOS font smoothing off or on for your user accou
 
 The HiDPI switch makes macOS draw at twice the monitor's resolution (3840×2160 for a 1080p monitor) and scale the result down to fit. Text and icons are drawn from Retina-quality detail, which can look smoother on a low-density monitor. It works by creating a virtual HiDPI display, mirroring the monitor to it, and keeping it while the app runs. Quitting the app returns the monitor to its normal mode. The app removes the virtual display if the monitor is disconnected. Choose 4K, 4.5K, or 5K under the switch. HiDPI on a Mac is always exactly 2×, so drawing more than 4K means a larger desktop: on a 1080p monitor, 4.5K looks like 2240×1260 and 5K looks like 2560×1440, which makes text and controls about 14% and 25% smaller. macOS rearranges open windows when the desktop size changes. Screenshots are taken at the drawing size while HiDPI is on. This uses an undocumented macOS interface that display utilities also rely on, so a future macOS update could break it.
 
-Click the ⋯ button in the panel for more options: choose a monitor when more than one compatible monitor is connected, Refresh, Launch at Login, and Quit.
+Click the ⋯ button in the panel for more options: choose a monitor when more than one external monitor is connected, Refresh, Launch at Login, and Quit.
 
-Refresh rescans monitors and reads their current brightness. The app also reconnects after sleep or display changes. It does not change brightness on launch. The monitor keeps its last brightness setting after you quit.
+Refresh rescans monitors and reads their current brightness. The app also reconnects after sleep or display changes. It does not change hardware brightness on launch, and a DDC/CI monitor keeps its last brightness setting after you quit. A software-dimmed monitor returns to full brightness when you quit, and the app dims it again the next time it opens.
 
 The app controls external monitors. It does not control the MacBook's built-in screen or request Accessibility or Screen Recording access.
 
@@ -113,6 +115,8 @@ If the app cannot find your monitor:
 2. Use the monitor's physical buttons to open its settings. Enable DDC/CI if that option is available.
 3. Try connecting the monitor directly to the Mac if you use a dock or adapter.
 4. Click Refresh in the app.
+
+If the panel says the monitor is dimmed in software but you expected hardware brightness, enable DDC/CI in the monitor's settings or connect it without an adapter, then click Refresh.
 
 If brightness does not change, check whether the monitor's picture mode locks brightness. The app reads the value back after each adjustment and reports communication failures.
 

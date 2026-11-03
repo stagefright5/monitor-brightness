@@ -8,6 +8,8 @@ import SwiftUI
 struct Monitor: Identifiable, Equatable {
     let id: String
     let name: String
+    /// Dimmed by scaling the display's gamma, for monitors that don't answer DDC/CI.
+    var software = false
 }
 
 struct BrightnessError: LocalizedError {
@@ -77,6 +79,120 @@ enum DDC {
     }
 }
 
+/// Software brightness for monitors without DDC/CI (many portable and TV-style displays):
+/// scales the display's gamma table, as MonitorControl and Lunar do. macOS restores the
+/// normal table when the app quits, so the saved level is reapplied on launch, and again
+/// whenever the system resets the table (display changes, wake, colour profile changes).
+@MainActor
+enum SoftwareDimmer {
+    /// The darkest the slider goes, as a fraction of normal output, so 0% never blacks out.
+    static let floor = 0.1
+    private static let levelsKey = "softwareBrightness"
+
+    private struct Table: Equatable {
+        var red: [CGGammaValue], green: [CGGammaValue], blue: [CGGammaValue]
+        func scaled(_ factor: Double) -> Table {
+            let f = CGGammaValue(factor)
+            return Table(red: red.map { $0 * f }, green: green.map { $0 * f }, blue: blue.map { $0 * f })
+        }
+        func matches(_ other: Table) -> Bool {
+            guard red.count == other.red.count else { return false }
+            return zip(red + green + blue, other.red + other.green + other.blue).allSatisfy { abs($0 - $1) < 0.002 }
+        }
+    }
+    /// Each display's table before dimming, and what was last written to it.
+    private static var baselines: [String: Table] = [:]
+    private static var applied: [String: Table] = [:]
+
+    static func factor(for percent: Double) -> Double {
+        floor + (1 - floor) * min(100, max(0, percent)) / 100
+    }
+
+    static func uuid(of display: CGDirectDisplayID) -> String? {
+        guard let uuid = CGDisplayCreateUUIDFromDisplayID(display)?.takeRetainedValue() else { return nil }
+        return CFUUIDCreateString(nil, uuid) as String?
+    }
+
+    private static func onlineDisplays() -> [CGDirectDisplayID] {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        CGGetOnlineDisplayList(16, &ids, &count)
+        return Array(ids.prefix(Int(count)))
+    }
+
+    /// External monitors, excluding the built-in screen and this app's HiDPI display.
+    static func externalMonitors() -> [Monitor] {
+        onlineDisplays()
+            .filter { CGDisplayIsBuiltin($0) == 0 && CGDisplayVendorNumber($0) != HiDPIController.vendorID }
+            .compactMap { id in
+                guard let uuid = uuid(of: id) else { return nil }
+                let name = NSScreen.screens.first { $0.displayID == id }?.localizedName ?? "External Display"
+                return Monitor(id: uuid, name: name, software: true)
+            }
+    }
+
+    private static func display(for uuid: String) -> CGDirectDisplayID? {
+        onlineDisplays().first { Self.uuid(of: $0) == uuid }
+    }
+
+    private static var levels: [String: Double] {
+        get { UserDefaults.standard.dictionary(forKey: levelsKey) as? [String: Double] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: levelsKey) }
+    }
+
+    static func level(for uuid: String) -> Double { levels[uuid] ?? 100 }
+
+    @discardableResult
+    static func setLevel(_ percent: Double, for uuid: String) -> Bool {
+        levels[uuid] = min(100, max(0, percent))
+        return apply(uuid, force: true)
+    }
+
+    private static func read(_ display: CGDirectDisplayID) -> Table? {
+        let capacity = 256
+        var red = [CGGammaValue](repeating: 0, count: capacity), green = red, blue = red
+        var count: UInt32 = 0
+        guard CGGetDisplayTransferByTable(display, UInt32(capacity), &red, &green, &blue, &count) == .success,
+              count > 0 else { return nil }
+        let n = Int(count)
+        return Table(red: Array(red.prefix(n)), green: Array(green.prefix(n)), blue: Array(blue.prefix(n)))
+    }
+
+    /// Writes the saved level to a display. Without `force`, only rewrites a table that
+    /// something else replaced, so it's cheap to call repeatedly.
+    @discardableResult
+    private static func apply(_ uuid: String, force: Bool) -> Bool {
+        guard let display = display(for: uuid), let current = read(display) else { return false }
+        // A table that isn't the one we wrote is the system's (or another app's) new normal.
+        if baselines[uuid] == nil || !(applied[uuid].map { current.matches($0) } ?? false) {
+            baselines[uuid] = current
+        } else if !force {
+            return true
+        }
+        let table = baselines[uuid]!.scaled(factor(for: level(for: uuid)))
+        guard CGSetDisplayTransferByTable(display, UInt32(table.red.count), table.red, table.green, table.blue) == .success
+        else { return false }
+        applied[uuid] = read(display) ?? table
+        return true
+    }
+
+    /// Reapplies dimming to connected monitors whose saved level is below 100%.
+    static func reapplyAll() {
+        let online = Set(externalMonitors().map(\.id))
+        for (uuid, level) in levels where level < 100 && online.contains(uuid) {
+            apply(uuid, force: false)
+        }
+    }
+
+    static var anyDimmed: Bool { levels.values.contains { $0 < 100 } }
+
+    static func restoreAll() {
+        CGDisplayRestoreColorSyncSettings()
+        baselines = [:]
+        applied = [:]
+    }
+}
+
 @MainActor
 final class BrightnessModel: ObservableObject {
     @Published var monitors: [Monitor] = []
@@ -109,16 +225,20 @@ final class BrightnessModel: ObservableObject {
         error = nil
         Task {
             do {
-                let all = DDC.parseDisplays(try await DDC.run(["display", "list"]))
-                // Only offer displays that actually support hardware brightness reads.
+                let all = DDC.parseDisplays((try? await DDC.run(["display", "list"])) ?? "")
+                // Prefer hardware brightness for displays that answer DDC/CI reads.
                 var supported: [Monitor] = []
                 for monitor in all {
                     if let _ = try? await DDC.read(monitor) { supported.append(monitor) }
                 }
+                // Every other external monitor gets software dimming.
+                for monitor in SoftwareDimmer.externalMonitors() where !supported.contains(where: { $0.id == monitor.id }) {
+                    supported.append(monitor)
+                }
                 guard revision == currentRevision else { return }
                 monitors = supported
                 guard !supported.isEmpty else {
-                    throw BrightnessError(message: "No compatible monitor found. Check the cable and enable DDC/CI in the monitor’s on-screen menu.")
+                    throw BrightnessError(message: "No external monitor found. Check the cable, then try Refresh.")
                 }
                 let preferred = selectedID.isEmpty ? UserDefaults.standard.string(forKey: "display") : selectedID
                 selectedID = supported.first { $0.id == preferred }?.id ?? supported[0].id
@@ -153,12 +273,17 @@ final class BrightnessModel: ObservableObject {
 
     private func loadSelection(_ currentRevision: Int) async throws {
         guard let monitor = selected else { return }
-        let maxValue = try await DDC.read(monitor, maximum: true)
-        let value = try await DDC.read(monitor)
-        guard revision == currentRevision else { return }
-        guard value <= maxValue else { throw BrightnessError(message: "The monitor reported an invalid brightness range.") }
-        maximum = maxValue
-        brightness = Double(value) / Double(maxValue) * 100
+        if monitor.software {
+            maximum = 100
+            brightness = SoftwareDimmer.level(for: monitor.id)
+        } else {
+            let maxValue = try await DDC.read(monitor, maximum: true)
+            let value = try await DDC.read(monitor)
+            guard revision == currentRevision else { return }
+            guard value <= maxValue else { throw BrightnessError(message: "The monitor reported an invalid brightness range.") }
+            maximum = maxValue
+            brightness = Double(value) / Double(maxValue) * 100
+        }
         hasValue = true
         ready = true
         loading = false
@@ -182,6 +307,14 @@ final class BrightnessModel: ObservableObject {
         pending?.cancel()
         revision += 1
         let currentRevision = revision
+        if monitor.software {
+            // Gamma changes are instant, so follow the slider without debouncing.
+            applying = false
+            UserDefaults.standard.set(brightness, forKey: "lastBrightness")
+            error = SoftwareDimmer.setLevel(brightness, for: monitor.id)
+                ? nil : "Couldn’t dim this monitor. Try Refresh."
+            return
+        }
         let value = Int((brightness / 100 * Double(maximum)).rounded())
         applying = true
         error = nil
@@ -586,6 +719,14 @@ struct PanelCard: View {
             .padding(.horizontal, 2)
             .animation(Motion.value, value: model.brightness)
 
+            if model.selected?.software == true {
+                Text("Dimmed in software. This monitor doesn’t support hardware brightness (DDC/CI).")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 5)
+            }
+
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     Text("Sharper text").font(.system(size: 12))
@@ -764,6 +905,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var menuIsOpen = false
     private var sizeObserver: AnyCancellable?
     private var scrollRemainder = 0.0
+    private var dimmingTimer: Timer?
     private var closeGeneration = 0
     private func trace(_ message: String) {
         if CommandLine.arguments.contains("--debug-ui") {
@@ -794,13 +936,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(displaysChanged), name: NSWorkspace.didWakeNotification, object: nil)
         login.configureOnFirstLaunch()
         hiDPI.start()
+        // Software dimming doesn't outlive the app; restore the saved level, and put it back
+        // if macOS resets the gamma table (wake, unlock, colour profile changes).
+        SoftwareDimmer.reapplyAll()
+        dimmingTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+            MainActor.assumeIsolated { if SoftwareDimmer.anyDimmed { SoftwareDimmer.reapplyAll() } }
+        }
         if CommandLine.arguments.contains("--open") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.togglePanel() }
         }
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        SoftwareDimmer.restoreAll()
+    }
+
     @objc func displaysChanged() {
         hiDPI.displaysChanged()
+        SoftwareDimmer.reapplyAll()
         // Read hardware only while controls are visible. Opening always rescans.
         if panel?.isVisible == true {
             model.refresh()
@@ -1004,14 +1157,19 @@ if CommandLine.arguments.contains("--login-status") {
     @unknown default: print("Launch at login: unknown status")
     }
 } else if CommandLine.arguments.contains("--check") {
-    do {
-        let displays = DDC.parseDisplays(try DDC.runSync(["display", "list"]))
-        for display in displays {
-            if let value = try? DDC.runSync(["display", display.id, "get", "luminance"]) {
-                print("\(display.name): \(value)")
-            }
+    let displays = DDC.parseDisplays((try? DDC.runSync(["display", "list"])) ?? "")
+    var hardware = Set<String>()
+    for display in displays {
+        if let value = try? DDC.runSync(["display", display.id, "get", "luminance"]) {
+            hardware.insert(display.id)
+            print("\(display.name): \(value) (DDC/CI)")
         }
-    } catch { fputs("\(error.localizedDescription)\n", stderr); exit(1) }
+    }
+    MainActor.assumeIsolated {
+        for monitor in SoftwareDimmer.externalMonitors() where !hardware.contains(monitor.id) {
+            print("\(monitor.name): \(Int(SoftwareDimmer.level(for: monitor.id)))% (software dimming)")
+        }
+    }
 } else if CommandLine.arguments.contains("--test") {
     let sample = "[1] Example Display (11111111-2222-3333-4444-555555555555)\ninvalid\n[2] Display (HDMI) (AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE)"
     let displays = DDC.parseDisplays(sample)
@@ -1046,6 +1204,13 @@ if CommandLine.arguments.contains("--login-status") {
     precondition(hiDPILooksLike(nativeWidth: 1920, nativeHeight: 1080, factor: HiDPILevel.all[1].factor) == (2240, 1260))
     precondition(hiDPILooksLike(nativeWidth: 1920, nativeHeight: 1080, factor: HiDPILevel.all[2].factor) == (2560, 1440))
     print("HiDPI levels draw at 3840×2160, 4480×2520 and 5120×2880 on a 1080p monitor")
+    MainActor.assumeIsolated {
+        precondition(SoftwareDimmer.factor(for: 100) == 1)
+        precondition(abs(SoftwareDimmer.factor(for: 0) - SoftwareDimmer.floor) < 1e-9)
+        precondition(SoftwareDimmer.factor(for: -5) == SoftwareDimmer.factor(for: 0))
+        precondition(SoftwareDimmer.factor(for: 50) > SoftwareDimmer.factor(for: 40))
+    }
+    print("Software dimming never goes fully dark")
     print("All checks passed")
 } else {
     MainActor.assumeIsolated {
